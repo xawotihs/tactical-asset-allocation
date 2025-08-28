@@ -31,7 +31,7 @@ def get_historical_total_return(
     the return calculation.
 
     Args:
-        price_data (pd.DataFrame): table of closing price
+        price_data (pd.DataFrame): table of closing price, are already converted to USD and adjusted for splits.
         portfolio_currency (str, optional): portfolio currency for returns. Defaults to None.
         return_type (str, optional): returns gross or net of dividends. Defaults to "total".
 
@@ -54,17 +54,27 @@ def get_historical_total_return(
         raise NotImplementedError
 
     if portfolio_currency is None:
+        # no conversion required
         return returns
 
-    # handle currency adjustment (not proven to work yet!)
-    currencies = get_issue_currency_for_tickers(tickers)
-    if all([fx == portfolio_currency for fx in currencies]):
-        return returns
+    # get fx returns for each ticker currency to the desired portfolio currency
+    fx_returns = get_currency_returns(['USD'], start_date, end_date, portfolio_currency)
+    fx_index = (1 + fx_returns).cumprod()
 
-    fx_returns = get_currency_returns(currencies, start_date, end_date, portfolio_currency)
-    fx_returns = fx_returns.reindex(returns.index).fillna(0)
-    fx_adj_returns = returns - fx_returns.values
-    return fx_adj_returns
+    # adjust price series for tickers whose issue currency != portfolio_currency
+    for ticker in returns.columns:
+        # multiply the USD price series by the FX index to get price in portfolio currency
+        price_data[ticker] = price_data[ticker].multiply(fx_index['USD'], axis=0)
+
+    # recompute returns on the converted prices
+    if return_type == "price":
+        returns = price_data.pct_change().dropna()
+    else:
+        dividends = get_historical_dividends(tickers, start_date, end_date)
+        dividends = dividends.reindex(price_data.index).fillna(0).loc[:, tickers]
+        returns = price_data.add(dividends).div(price_data.shift(1).values).sub(1).dropna()
+
+    return returns
 
 
 @numba.njit
@@ -89,15 +99,34 @@ def calculate_drifted_weight_returns(
     """
     n_obs, n_assets = returns.shape[0], weights.shape[1]
     total_return = np.zeros((n_obs, 1), dtype=np.float64)
-    w_drift = np.zeros(n_assets)
 
+    # initialize drift weights to the first provided weights row if available
+    if weights.shape[0] > 0:
+        w_drift = weights[0, :].astype(np.float64).copy()
+    else:
+        w_drift = np.zeros(n_assets, dtype=np.float64)
+
+    # Iterate days: compute the day's portfolio return using the current (drifted)
+    # weights, then if this day is a rebalance date, update w_drift so the new
+    # weights apply from the next day (next-day semantics).
     for i in range(n_obs):
-        if i in rebal_index:
-            w_drift = weights[np.where(rebal_index == i)[0][0], :]
+        r_day = returns[i, :]
+        # portfolio return for the day uses current weights
+        total_return[i, :] = np.nansum(w_drift * r_day)
+
+        # normalized update of w_drift based on market moves
+        denom = np.nansum(w_drift * (1 + r_day))
+        if denom == 0:
+            # avoid division by zero; keep current weights
+            w_drift = w_drift
         else:
-            r_day = returns[i, :]
-            total_return[i, :] = np.nansum(w_drift * r_day)
-            w_drift = (w_drift * (1 + r_day)) / np.nansum(w_drift * (1 + r_day))
+            w_drift = (w_drift * (1 + r_day)) / denom
+
+        # if today is a rebalance date, replace w_drift with the target weights
+        # so they will be used from the next day onwards
+        if i in rebal_index:
+            w_drift = weights[np.where(rebal_index == i)[0][0], :].astype(np.float64)
+
     return total_return
 
 
@@ -145,13 +174,30 @@ class Backtester:
             pd.DataFrame: table of simple returns per strategy
         """
         strat_weights = self.weights[strategy].unstack().fillna(0)
+        # Filter out future weight dates that are beyond our returns data
+        strat_weights = strat_weights[strat_weights.index <= returns.index.max()]
+
+        # select returns for the assets in the weight table
         strat_returns = returns.loc[:, strat_weights.columns]
-        temp_idx = pd.bdate_range(strat_weights.index.min(), strat_returns.index.max())
+
+        # include returns prior to the first rebalance: start from the returns series
+        temp_idx = pd.bdate_range(returns.index.min(), strat_returns.index.max())
         strat_returns = strat_returns.reindex(temp_idx).fillna(0)
-        rebal_index = list(map(strat_returns.index.get_loc, strat_weights.index))
+
+        # drop weight dates earlier than available returns (avoid get_loc KeyError)
+        strat_weights = strat_weights[strat_weights.index >= strat_returns.index.min()]
+
+        # map rebalancing dates into the reindexed returns index using get_indexer
+        # this allows nearest/ffill mapping and avoids KeyError on exact lookup
+        rebal_pos = strat_returns.index.get_indexer(strat_weights.index, method="pad")
+        # if pad cannot find a position (returns -1), set to first available day
+        rebal_pos = np.where(rebal_pos == -1, 0, rebal_pos)
+        rebal_index = rebal_pos.tolist()
+
         total_return = calculate_drifted_weight_returns(
             np.asarray(strat_returns), np.asarray(strat_weights), np.asarray(rebal_index)
         )
+
         return pd.DataFrame(total_return, index=strat_returns.index, columns=[strategy])
 
     def run(
@@ -174,8 +220,9 @@ class Backtester:
             end_date = self.rebal_dates.max() + pd.offsets.BDay(1)
 
         # retrieve data for total return calculation
-        prices = get_historical_price_data(self.assets, start_date, end_date).loc[:, "Close"]
+        prices = get_historical_price_data(self.assets, start_date, end_date, adjust=True, convert_to_usd=True).loc[:, "Close"]
         returns = get_historical_total_return(prices, self.portfolio_currency, return_type)
+
         portfolio_total_return = []
 
         for strategy in self.weights.columns:

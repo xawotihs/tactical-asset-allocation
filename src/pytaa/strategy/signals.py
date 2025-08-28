@@ -74,16 +74,24 @@ class Signal:
             return self.monthly_prices.div(sma) - 1
         return sma
 
-    def protective_momentum_score(self) -> pd.DataFrame:
+    def average_return(self) -> pd.DataFrame:
+        """Calculate average return over the last 12 months."""
+        avg_return = np.zeros_like(self.monthly_prices)
+        for horizon in [1, 3, 6, 12]:
+            avg_return += 0.25 * self.monthly_prices.div(self.monthly_prices.shift(horizon))
+        return avg_return - 1
+
+    def protective_momentum_score(self,risk_assets) -> pd.DataFrame:
         """Calculate momentum score for Generalized Protective Momentum portfolios."""
-        returns = self.prices.pct_change()
-        ew_basket = returns.mean(axis=1).rename("ew_basket")
+        returns = self.monthly_prices.pct_change()
+        ew_basket = returns[risk_assets].mean(axis=1).rename("ew_basket")
+        #ew_basket = returns.mean(axis=1).rename("ew_basket")
         grouper = returns.join(ew_basket)
-        rolling_corr = grouper.rolling(252).corr(grouper["ew_basket"]).resample("BME").last()
+        rolling_corr = grouper.rolling(12).corr(grouper["ew_basket"])
 
         avg_return = np.zeros_like(self.monthly_prices)
         for horizon in [1, 3, 6, 12]:
             avg_return += 0.25 * self.monthly_prices.div(self.monthly_prices.shift(horizon))
 
-        score = avg_return * (1 - rolling_corr)
+        score = (avg_return-1) * (1 - rolling_corr)
         return score

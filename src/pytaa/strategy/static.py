@@ -2,6 +2,12 @@
 
 STRATEGIES = [
     {
+        "tag": "VT",
+        "name": "VT and chill",
+        "riskAssets": ["VT"],
+        "frequency": "M",
+    },
+    {
         "tag": "IVY",
         "name": "Ivy",
         "riskAssets": ["VTI", "VEU", "VNQ", "AGG", "DBC"],
@@ -77,16 +83,44 @@ STRATEGIES = [
             "SPY",
             "QQQ",
             "IWM",
-            "VGK",
             "EWJ",
+            "VGK",
             "EEM",
-            "VNQ",
-            "DBC",
             "GLD",
+            "GSG",
+            "IYR",
             "HYG",
             "LQD",
+            "TLT"
+        ],
+        "safeAssets": ["SHY", "IEF"],
+        "frequency": "M",
+    },
+    {
+        "tag": "HAA4",
+        "name": "Hybrid Asset Allocation",
+        "riskAssets": [
+            "SPY",
+            "IWM",
+            "VEA",
+            "VWO",
+            "DBC",
+            "VNQ",
+            "TLT",
+            "IEF",
         ],
         "safeAssets": ["BIL", "IEF"],
+        "canaryAssets": ["TIP"],
+        "frequency": "M",
+    },
+    {
+        "tag": "HAA1",
+        "name": "Hybrid Asset Allocation",
+        "riskAssets": [
+            "SPY",
+        ],
+        "safeAssets": ["BIL", "IEF"],
+        "canaryAssets": ["TIP"],
         "frequency": "M",
     },
     {
@@ -211,7 +245,7 @@ STRATEGIES = [
     {
         "tag": "GDM",
         "name": "GEM Dual Momentum",
-        "riskAssets": ["SPY", "AGG", "EFA"],
+        "riskAssets": ["IVV", "BND", "VEU"],
         "canaryAssets": ["BIL"],
         "frequency": "M",
     },

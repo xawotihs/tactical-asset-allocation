@@ -39,11 +39,54 @@ class Positions:
 class EqualWeights(Positions):
     """Store equally weighted portfolio."""
 
-    def __init__(self, assets: List[str], rebalance_dates: List[datetime]):
+    def __init__(self, assets: List[str], rebalance_dates: List[datetime], name: str = "EW"):
         """Initialize and create equally weighted portfolio."""
         super().__init__(assets, rebalance_dates)
-        self.__name__ = "EW"
+        self.__name__ = name
         position = np.ones(self.n_assets) / self.n_assets
+        self.weights[self.__name__] = np.tile(position, self.n_obs)
+        self.weights.sort_index(inplace=True)
+        self.weights.index.names = ["Date", "ID"]
+
+
+class StaticAllocation(Positions):
+    """Fixed/static allocation across assets.
+
+    Use this class to create a constant allocation across rebalance dates. The
+    allocation can be provided as a dictionary mapping tickers to weights or as
+    an iterable (list/ndarray) with the same order as the provided `assets`.
+
+    Example:
+        StaticAllocation(['SPY', 'TLT'], rebalance_dates, {'SPY': 0.6, 'TLT': 0.4}, name='60_40')
+    """
+
+    def __init__(self, assets: List[str], rebalance_dates: List[datetime], allocation, name: str = "STATIC"):
+        """Create a static allocation.
+
+        Args:
+            assets (List[str]): list of tickers in the portfolio (order matters for list allocation).
+            rebalance_dates (List[datetime]): list of rebalance dates.
+            allocation (dict|list|np.ndarray): target weights either as dict {ticker: weight}
+                or as list/array matching the order of `assets`.
+            name (str): column name for the weights DataFrame.
+        """
+        super().__init__(assets, rebalance_dates)
+        self.__name__ = name
+
+        # build position vector in the order of self.assets
+        if isinstance(allocation, dict):
+            position = np.array([float(allocation.get(a, 0.0)) for a in self.assets], dtype=float)
+        else:
+            position = np.asarray(allocation, dtype=float)
+            if position.ndim != 1 or position.shape[0] != self.n_assets:
+                raise ValueError("Allocation must be a 1D array with the same length as assets")
+
+        # normalize to sum to 1 if not already
+        s = position.sum()
+        if s == 0:
+            raise ValueError("Allocation sums to zero")
+        position = position / s
+
         self.weights[self.__name__] = np.tile(position, self.n_obs)
         self.weights.sort_index(inplace=True)
         self.weights.index.names = ["Date", "ID"]
@@ -307,6 +350,112 @@ def aqr_trend_allocation(
         weights = risk_weights.rename(date).to_frame().T
         weights.columns.name, weights.index.name = "ID", "Date"
         weights[[cash_asset]] = 1 - risk_allocation
+        strategy_weights.append(weights)
+
+    return pd.concat(strategy_weights).fillna(0)
+
+def protective_allocation(
+    returns: pd.DataFrame,
+    signal: pd.DataFrame,
+    rebalance_dates: pd.DatetimeIndex,
+    risk_assets: List[str],
+    safe_assets: List[str],
+    crash_protection: int = 2,
+    top_k: int = 3,
+) -> pd.DataFrame:
+    """Allocate portfolio to trending assets using Generalized Protective Momentum.
+
+    Args:
+        returns (pd.DataFrame): table of asset returns
+        signal (pd.DataFrame): table of signals, i.e. SMA crossovers
+        rebalance_dates (pd.DatetimeIndex): list of rebalance dates
+        risk_assets (List[str]): list of risky assets
+        safe_assets (str): safe or cash asset
+        crash_protection: how much crash protection to apply (0-4),
+        top_k: how many risky assets to include
+
+    Returns:
+        pd.DataFrame: a table of portfolio weights
+    """
+    strategy_weights = []
+    
+    bf = signal[risk_assets].lt(0).sum(axis=1) / (len(risk_assets) - crash_protection * (len(risk_assets)/4))
+    # Handle case where all values might be NA by filling NA with -inf
+    cash_asset = signal[safe_assets].fillna(-float('inf')).idxmax(axis=1)
+
+    rebal_dates = [i for i in rebalance_dates if i >= signal.index[0]]
+
+    # for all dates in bf
+    for date in rebal_dates:
+        weights = None
+        # if bf > 100% then allocate 100% to safe asset with highest momentum
+        if bf.loc[date] > 1:
+            weights = pd.DataFrame({cash_asset.loc[date]: [1]}, index=[date])
+        # if 0 <= bf <= 100% then allocate bf% to safe asset with highest momentum
+        else: #if bf.loc[date] > 0:
+            if bf.loc[date] > 0:
+                weights = pd.DataFrame({cash_asset.loc[date]: [bf.loc[date]]}, index=[date])
+            else:
+                weights = pd.DataFrame()
+            # then allocate the remaining weight to the top k risk assets
+
+            remaining_weight = 1 - bf.loc[date]
+            top_k_assets = signal[risk_assets].loc[date].nlargest(top_k).index
+            weights = pd.concat([weights, pd.DataFrame({a: [remaining_weight / top_k] for a in top_k_assets}, index=[date])], axis=1)
+        #print(weights)
+        strategy_weights.append(weights)
+    return pd.concat(strategy_weights).fillna(0)
+
+def haa_allocation(
+    signal: pd.DataFrame,
+    rebalance_dates: pd.DatetimeIndex,
+    risk_assets: List[str],
+    safe_assets: List[str],
+    canary_asset: str,
+) -> pd.DataFrame:
+    """Allocate portfolio to trending assets using hybrid asset allocation.
+
+    Args:
+        signal (pd.DataFrame): table of signals, i.e. SMA crossovers
+        rebalance_dates (pd.DatetimeIndex): list of rebalance dates
+        risk_assets (List[str]): list of risky assets
+        safe_assets (List[str]): list of safe assets
+        canary_asset (str): canary asset to determine risk-on or risk-off
+
+    Returns:
+        pd.DataFrame: a table of portfolio weights
+    """  
+    strategy_weights = []
+    
+    # for all dates
+    for date in rebalance_dates[rebalance_dates >= signal.dropna().index.min()]:
+        # select the cash asset as the asset in safe_asset list with the highest signal
+        cash_asset = signal[safe_assets].loc[date].idxmax()
+
+        # if the signal of the canary asset is negative, allocate 100% to the safe asset with the highest signal
+        if signal.loc[date, canary_asset] <= 0:
+            weights = pd.DataFrame({cash_asset: [1]}, index=[date])
+        else:
+            # for the top 4 risk assets, allocate 25% to each if the signal is positive
+            top_k_assets = signal[risk_assets].loc[date].nlargest(4).index
+            
+            if len(top_k_assets) == 0:
+                weights = pd.DataFrame({cash_asset: [1]}, index=[date])
+            else:
+                # Initialize weights dictionary with cash asset to prevent empty dict
+                weight_dict = {cash_asset: 0}
+                asset_weight = 1.0 / len(top_k_assets)  # Equal weight for each of the top 4 assets
+                
+                # for each asset in top_k_assets, allocate equal weight if signal is positive, 
+                # otherwise allocate that weight to the cash asset
+                for asset in top_k_assets:
+                    if signal.loc[date, asset] > 0:
+                        weight_dict[asset] = asset_weight
+                    else:
+                        weight_dict[cash_asset] += asset_weight
+                
+                weights = pd.DataFrame(weight_dict, index=[date])
+            
         strategy_weights.append(weights)
 
     return pd.concat(strategy_weights).fillna(0)

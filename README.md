@@ -24,6 +24,7 @@ For an overview of various TAA strategies please have a look at the `src/taa/str
 - Eychenne, Karl, Stéphane Martinetti, and Thierry Roncalli. ‘Strategic Asset Allocation’. SSRN Scholarly Paper. Rochester, NY, 1 March 2011. [https://doi.org/10.2139/ssrn.2154021](https://doi.org/10.2139/ssrn.2154021).
 - Keller, Wouter J., and Jan Willem Keuning. ‘Breadth Momentum and the Canary Universe: Defensive Asset Allocation (DAA)’. SSRN Scholarly Paper. Rochester, NY, 12 July 2018. [https://doi.org/10.2139/ssrn.3212862](https://doi.org/10.2139/ssrn.3212862).
 - Keller, Wouter J., and Jan Willem Keuning. ‘Protective Asset Allocation (PAA): A Simple Momentum-Based Alternative for Term Deposits’. SSRN Scholarly Paper. Rochester, NY, 5 April 2016. [https://doi.org/10.2139/ssrn.2759734](https://doi.org/10.2139/ssrn.2759734).
+- Keller, Keuning. 'Dual and Canary Momentum with Rising Yields/Inflation: Hybrid Asset Allocation (HAA)'. 3 Feb 2023 [https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4346906]
 - Kritzman, Mark, Sébastien Page, and David Turkington. ‘Regime Shifts: Implications for Dynamic Strategies’. _Financial Analysts Journal_, 2012, 18.
 - WifeyAlpha, Tactical Asset Allocation, https://twitter.com/WifeyAlpha/status/1502576435134877701
 
