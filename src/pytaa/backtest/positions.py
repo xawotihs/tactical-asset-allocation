@@ -233,6 +233,247 @@ def vigilant_allocation(
     return pd.DataFrame(weights, index=safety.index).T
 
 
+def top_n_equal_weights(signals: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    """Build equal-weighted top-N weights from a signal DataFrame.
+
+    For each row (rebalance date) the function selects up to ``top_n`` assets
+    with the largest positive signal values and assigns them equal weights
+    summing to 1. If fewer than ``top_n`` assets have positive signals the
+    positive assets receive equal weight. If no assets have positive signals
+    the row is all zeros.
+
+    Args:
+        signals (pd.DataFrame): index = dates, columns = asset identifiers; may
+            contain NaN values. NaNs are treated as non-positive.
+        top_n (int): number of top assets to select per row. Must be >= 1.
+
+    Returns:
+        pd.DataFrame: weights in the same wide format as ``signals`` with
+        float weights (rows sum to 1 when any positive signals exist).
+    """
+    if not isinstance(signals, pd.DataFrame):
+        raise TypeError("signals must be a pandas DataFrame")
+    if not isinstance(top_n, int) or top_n < 1:
+        raise ValueError("top_n must be an integer >= 1")
+
+    # Treat NaN as non-positive so they are not selected
+    sig = signals.fillna(-np.inf)
+
+    def _row_top_weights(row: pd.Series) -> pd.Series:
+        # consider only positive signals
+        positives = row[row > 0.0]
+        if positives.empty:
+            return pd.Series(0.0, index=row.index)
+
+        n = min(top_n, positives.shape[0])
+        top_idx = positives.nlargest(n).index
+        w = pd.Series(0.0, index=row.index)
+        w.loc[top_idx] = 1.0 / float(n)
+        return w
+
+    weights = sig.apply(_row_top_weights, axis=1)
+    # preserve any index/column names from input
+    weights.index.name = signals.index.name
+    weights.columns.name = signals.columns.name
+    return weights
+
+
+def best_mix_between_weights(
+    weights_list: List[pd.DataFrame],
+    alloc_ranges: List[tuple],
+    prices: pd.DataFrame,
+    lookback_days: int = 21,
+    step_pct: int = 10,
+) -> tuple:
+    """Choose best allocation per rebalance date between multiple weight tables.
+
+    This function accepts a list of wide-format weight DataFrames (index=dates,
+    columns=assets) and a matching list of allocation ranges for each weights
+    DataFrame. Each allocation range is a tuple (min_pct, max_pct) expressed in
+    percent (0-100). The function enumerates all allocations that are multiples
+    of ``step_pct`` within each range and whose sum is 100, evaluates the
+    portfolio Sharpe over the prior ``lookback_days`` of daily returns, and
+    selects the allocation with the highest Sharpe for each rebalance date.
+
+    Args:
+        weights_list: list of pd.DataFrame weight tables (wide format)
+        alloc_ranges: list of (min_pct, max_pct) tuples matching weights_list
+        prices: DataFrame of asset prices with DatetimeIndex
+        lookback_days: lookback window to compute Sharpe (trading days)
+        step_pct: allocation granularity in percent (default 10)
+
+    Returns:
+        combined_weights (pd.DataFrame): combined wide-format weights per date
+        summary (pd.DataFrame): per-date summary with chosen allocation and Sharpe
+    """
+    from itertools import product
+
+    # basic validation
+    if not isinstance(weights_list, list) or len(weights_list) == 0:
+        raise TypeError("weights_list must be a non-empty list of DataFrames")
+    if not isinstance(alloc_ranges, list) or len(alloc_ranges) != len(weights_list):
+        raise TypeError("alloc_ranges must be a list of the same length as weights_list")
+    if not isinstance(prices, pd.DataFrame):
+        raise TypeError("prices must be a pandas DataFrame of asset prices")
+
+    # union of assets and rebalance dates
+    # normalize weights_list: accept either wide-format (index=dates, columns=assets)
+    # or stacked MultiIndex (Date, ID) where values are weights (common in this repo).
+    norm_weights = []
+    for w in weights_list:
+        # make a copy to avoid mutating caller
+        ww = w.copy()
+        # if stacked (MultiIndex) convert to wide by unstacking the second level
+        if getattr(ww.index, "nlevels", 1) == 2:
+            # If DataFrame with multiple columns, try to collapse by unstacking each column
+            if ww.shape[1] == 1:
+                s = ww.iloc[:, 0]
+                wide = s.unstack(level=1)
+            else:
+                # when multiple columns, prefer to take each column separately and sum across
+                # columns after unstacking to produce a single wide table per input
+                unstacked_list = [ww.iloc[:, i].unstack(level=1) for i in range(ww.shape[1])]
+                # align and sum (treating NaN as 0)
+                wide = pd.concat(unstacked_list, axis=0).groupby(level=0).sum()
+        else:
+            wide = ww
+        # ensure index is DatetimeIndex (no tz) for comparisons
+        if not isinstance(wide.index, pd.DatetimeIndex):
+            try:
+                wide.index = pd.DatetimeIndex(wide.index, tz="utc").tz_convert(None)
+            except Exception:
+                # fallback: coerce via to_datetime
+                wide.index = pd.to_datetime(wide.index)
+        norm_weights.append(wide)
+
+    # replace weights_list with normalized wide tables
+    weights_list = norm_weights
+
+    cols = sorted({c for w in weights_list for c in w.columns.astype(str)}.union(set(prices.columns.astype(str))))
+    dates = sorted({d for w in weights_list for d in w.index})
+
+    # precompute price returns
+    price_rets = prices.reindex(columns=cols).pct_change()
+
+    # prepare allowed allocation choices per weight (in percent)
+    alloc_choices = []
+    for (mn, mx) in alloc_ranges:
+        if not (0 <= mn <= mx <= 100):
+            raise ValueError("allocation ranges must be between 0 and 100 and min <= max")
+        choices = list(range(int(mn), int(mx) + 1, int(step_pct)))
+        if len(choices) == 0:
+            raise ValueError("no allocation choices generated for a range; adjust step_pct or range")
+        alloc_choices.append(choices)
+
+    # helper: generate candidate allocations that sum to 100
+    candidate_allocs = []
+    for comb in product(*alloc_choices):
+        if sum(comb) == 100:
+            candidate_allocs.append(list(comb))
+
+    if len(candidate_allocs) == 0:
+        raise ValueError("no candidate allocations sum to 100 with the given ranges and step_pct")
+
+    combined_rows = []
+    summary_records = []
+
+    # helper to produce a default allocation when not enough history: allocate mins then distribute
+    def _default_alloc(ranges, step):
+        alloc = [int(r[0]) for r in ranges]
+        remaining = 100 - sum(alloc)
+        if remaining < 0:
+            raise ValueError("sum of minimums in ranges exceeds 100")
+        # distribute remaining in step increments to those who can accept more
+        i = 0
+        n = len(alloc)
+        while remaining > 0:
+            idx = i % n
+            max_add = int(ranges[idx][1]) - alloc[idx]
+            add = min(step, max_add, remaining)
+            if add > 0:
+                alloc[idx] += add
+                remaining -= add
+            i += 1
+            # guard: if loop cycles without progress, break
+            if i > n * 100:
+                break
+        if remaining != 0:
+            # as fallback normalize to nearest step
+            base = [int(round(a / step) * step) for a in alloc]
+            total = sum(base)
+            if total == 0:
+                raise ValueError("cannot build default allocation from ranges")
+            factor = 100 / total
+            base = [int(round(b * factor / step) * step) for b in base]
+            # adjust last
+            diff = 100 - sum(base)
+            base[-1] += diff
+            return base
+        return alloc
+
+    # evaluate each date
+    for date in dates:
+        # build group weight rows for this date
+        rows = [w.reindex(index=[date], columns=cols).fillna(0.0).iloc[0] for w in weights_list]
+
+        # find end_date for returns (last available <= date)
+        available_dates = price_rets.index[price_rets.index <= date]
+        if len(available_dates) == 0:
+            # skip dates with no price history
+            continue
+        end_date = available_dates.max()
+
+        rets_window = price_rets.loc[:end_date].iloc[-lookback_days:]
+        if rets_window.empty or rets_window.shape[0] < 2:
+            # not enough history: pick default allocation
+            chosen_alloc = _default_alloc(alloc_ranges, step_pct)
+            sharpe_map = {tuple(a): None for a in candidate_allocs}
+        else:
+            # compute each group's return series
+            group_rets = []
+            for r in rows:
+                grp = (rets_window * r).sum(axis=1)
+                group_rets.append(grp)
+
+            # evaluate candidates
+            best_sharpe = None
+            chosen_alloc = None
+            sharpe_map = {}
+            for alloc in candidate_allocs:
+                # compute portfolio series
+                port = sum((alloc[i] / 100.0) * group_rets[i] for i in range(len(alloc)))
+                if port.std() == 0 or port.empty:
+                    sharpe = None
+                else:
+                    sharpe = float((port.mean() * 252) / (port.std() * (252 ** 0.5)))
+                sharpe_map[tuple(alloc)] = sharpe
+                if sharpe is not None and (best_sharpe is None or sharpe > best_sharpe):
+                    best_sharpe = sharpe
+                    chosen_alloc = alloc
+
+            if chosen_alloc is None:
+                # fallback to default if no valid sharpe found
+                chosen_alloc = _default_alloc(alloc_ranges, step_pct)
+
+        # build combined weight row
+        combined = sum((chosen_alloc[i] / 100.0) * rows[i] for i in range(len(rows)))
+        combined.name = date
+        combined_rows.append(combined)
+
+        # record summary
+        rec = {"date": date, "chosen_alloc": tuple(chosen_alloc), "chosen_sharpe": sharpe_map.get(tuple(chosen_alloc))}
+        # optionally include top few candidate sharpes (store as stringified dict)
+        rec["candidates_tried"] = len(candidate_allocs)
+        summary_records.append(rec)
+
+    if len(combined_rows) == 0:
+        return pd.DataFrame(columns=cols), pd.DataFrame()
+
+    combined_weights = pd.DataFrame(combined_rows).sort_index()
+    summary = pd.DataFrame(summary_records).set_index("date").sort_index()
+    return combined_weights, summary
+
+
 def kipnis_allocation(
     returns: pd.DataFrame,
     signals: pd.DataFrame,
@@ -383,7 +624,7 @@ def protective_allocation(
     # Handle case where all values might be NA by filling NA with -inf
     cash_asset = signal[safe_assets].fillna(-float('inf')).idxmax(axis=1)
 
-    rebal_dates = [i for i in rebalance_dates if i >= signal.index[0]]
+    rebal_dates = [i for i in rebalance_dates if (i >= signal.index[0] and i <= bf.dropna().index.max())]
 
     # for all dates in bf
     for date in rebal_dates:
@@ -427,8 +668,14 @@ def haa_allocation(
     """  
     strategy_weights = []
     
-    # for all dates
-    for date in rebalance_dates[rebalance_dates >= signal.dropna().index.min()]:
+    # for all dates: build a boolean mask instead of using Python 'and' on arrays
+    sd = signal.dropna()
+    if sd.empty:
+        # nothing to allocate when there are no valid signals
+        return pd.DataFrame()
+
+    mask = (rebalance_dates >= sd.index.min()) & (rebalance_dates <= sd.index.max())
+    for date in rebalance_dates[mask]:
         # select the cash asset as the asset in safe_asset list with the highest signal
         cash_asset = signal[safe_assets].loc[date].idxmax()
 

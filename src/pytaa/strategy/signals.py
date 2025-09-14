@@ -48,6 +48,61 @@ class Signal:
         norm_score = score - 19
         return norm_score
 
+    def sharpe_ratio_score(self, duration: int, risk_free: float = 0.0, f: float = 1.0) -> pd.DataFrame:
+        """Compute Sharpe ratio score for each asset at each monthly date.
+
+        For each month (using `self.monthly_prices` index) this method looks back
+        `duration` calendar days on the original daily `self.prices`, computes daily
+        returns over that window, and then computes an annualized Sharpe ratio per
+        asset:
+
+            sharpe = (mean_daily_returns*252 - risk_free) / (std_daily_returns*sqrt(252))
+
+        Args:
+            duration (int): number of past days to use for Sharpe calculation.
+            risk_free (float): annual risk-free rate (expressed in same units as returns,
+                e.g. 0.0 for 0%). Defaults to 0.0.
+
+        Returns:
+            pd.DataFrame: DataFrame indexed by monthly dates with columns for each asset
+                containing the Sharpe ratio (NaN where insufficient data).
+        """
+        # Prepare output DataFrame with same index and columns as monthly_prices
+        sharpe_df = pd.DataFrame(index=self.monthly_prices.index, columns=self.monthly_prices.columns, dtype=float)
+
+        # Annualization factors
+        trading_days = 252.0
+        sqrt_td = np.sqrt(trading_days)
+
+        for date in self.monthly_prices.index:
+            # define window: include days up to and including the monthly date
+            end = date
+            start = end - pd.Timedelta(days=duration)
+
+            window = self.prices.loc[start:end]
+            if window.shape[0] < 2:
+                # not enough daily points to compute returns
+                continue
+
+            # compute daily returns for window
+            daily_rets = window.pct_change().dropna(how="all")
+            if daily_rets.shape[0] < 1:
+                continue
+
+            # mean and std per column
+            mean_daily = daily_rets.mean(axis=0)
+            std_daily = daily_rets.std(axis=0, ddof=1)
+
+            # avoid division by zero
+            with np.errstate(divide="ignore", invalid="ignore"):
+                sharpe = (mean_daily * trading_days - risk_free) / (pow(std_daily, f) * sqrt_td)
+
+            # assign to output row
+            sharpe_df.loc[date] = sharpe
+
+        return sharpe_df
+
+
     def sma_crossover(
         self, lookback: int = 12, crossover: bool = True, days: int = 21
     ) -> pd.DataFrame:

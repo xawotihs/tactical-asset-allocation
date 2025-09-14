@@ -201,7 +201,7 @@ class Backtester:
         return pd.DataFrame(total_return, index=strat_returns.index, columns=[strategy])
 
     def run(
-        self, end_date: str = None, frequency: str = None, return_type: str = "total"
+        self, end_date: str = None, frequency: str = None, return_type: str = "total", prices = None
     ) -> pd.DataFrame:
         """Run backtester and return strategy returns.
 
@@ -220,7 +220,8 @@ class Backtester:
             end_date = self.rebal_dates.max() + pd.offsets.BDay(1)
 
         # retrieve data for total return calculation
-        prices = get_historical_price_data(self.assets, start_date, end_date, adjust=True, convert_to_usd=True).loc[:, "Close"]
+        if prices is None:
+            prices = get_historical_price_data(self.assets, start_date, end_date, adjust=True, convert_to_usd=True).loc[:, "Close"]
         returns = get_historical_total_return(prices, self.portfolio_currency, return_type)
 
         portfolio_total_return = []

@@ -146,9 +146,6 @@ def get_historical_price_data(
                             fx_rates = fx_rates.iloc[:, 0]
                         fx_rates = pd.to_numeric(fx_rates, errors='coerce').ffill().replace(0, pd.NA).fillna(1.0)
 
-                        # Debug
-                        print(f"Converting {ticker} prices using {fx_pair}")
-
                         # Handle single-level columns easily
                         if data.columns.nlevels == 1:
                             for col in ["Open", "High", "Low", "Close"]:
